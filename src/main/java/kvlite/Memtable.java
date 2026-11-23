@@ -3,7 +3,6 @@ package kvlite;
 
 import java.nio.charset.StandardCharsets;
 import java.util.TreeMap;
-import java.util.Optional;
 
 final class Memtable {
     private final TreeMap<String, Entry> entries = new TreeMap<>();
@@ -17,9 +16,16 @@ final class Memtable {
         encodedBytes += sizeOf(entry);
     }
 
-    Optional<String> get(String key) {
-        Entry entry = entries.get(key);
-        return entry == null ? Optional.empty() : entry.value();
+    Entry get(String key) {
+        return entries.get(key);
+    }
+
+    Iterable<Entry> sortedEntries() {
+        return entries.values();
+    }
+
+    boolean isEmpty() {
+        return entries.isEmpty();
     }
 
     long encodedBytes() {

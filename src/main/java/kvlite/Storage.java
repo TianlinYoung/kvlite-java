@@ -7,6 +7,7 @@ import java.util.Optional;
 
 public interface Storage extends Closeable {
     void put(String key, String value) throws IOException;
-    Optional<String> get(String key);
+    Optional<String> get(String key) throws IOException;
+    void flush() throws IOException;
     void delete(String key) throws IOException;
 }

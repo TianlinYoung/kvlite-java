@@ -2,7 +2,6 @@
 package kvlite;
 
 import org.junit.jupiter.api.Test;
-import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.*;
 
 class MemtableTest {
@@ -15,7 +14,8 @@ class MemtableTest {
         assertEquals(5, table.encodedBytes());
         table.apply(Entry.delete("猫"));
         assertEquals(4, table.encodedBytes());
-        assertEquals(Optional.empty(), table.get("猫"));
-        assertEquals(Optional.of(""), table.get("a"));
+        assertEquals(Entry.delete("猫"), table.get("猫"));
+        assertEquals(Entry.put("a", ""), table.get("a"));
+        assertNull(table.get("missing"));
     }
 }

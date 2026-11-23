@@ -78,6 +78,10 @@ final class Wal implements Closeable {
         return buffer.array();
     }
 
+    long size() throws IOException {
+        return file.size();
+    }
+
     private void discardTail(long start) throws IOException {
         file.truncate(start);
         file.position(start);
