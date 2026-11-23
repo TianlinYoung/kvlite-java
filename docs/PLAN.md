@@ -27,6 +27,7 @@ kvlite-java/
 ├── src/main/java/kvlite/
 │   ├── Storage, LsmStorage, Memtable, Entry, EntryCodec, Wal
 │   ├── TableSet, SSTableReader, FileSSTableReader, SSTableWriter
+│   ├── MergingIterator         阶段 3
 │   ├── Repl                    阶段 4
 │   └── Benchmark               阶段 4
 ├── src/test/java/kvlite/
@@ -42,9 +43,10 @@ kvlite-java/
 | `TableSet` | 读取和提交 manifest 快照，管理当前 WAL 与 SSTable 文件集合。 |
 | `SSTableReader` / `FileSSTableReader` | 隔离表的点查找及按范围顺序读。文件实现解析 footer 和稀疏索引，按需读取记录。 |
 | `SSTableWriter` | 顺序写入已排序的唯一 key，记录索引偏移并生成 footer。 |
+| `MergingIterator` | 用 `PriorityQueue` 归并多个有序来源，每个 key 只交付最新记录。scan 和 compaction 共用。 |
 | `Repl` / `Benchmark` | REPL 解析命令和展示结果。基准程序独立执行可复现的测试负载。 |
 
-阶段 3 先把合并规则放在引擎的一处，等出现清晰的职责边界再决定是否提取成类。每个源文件开头一句话说明职责。代码首次用到 `ByteBuffer`、`RandomAccessFile`、fsync 或 try-with-resources 时，用短注释解释它在这里解决什么问题。需要在多个读线程中定位文件时，每次读操作使用自己的 `RandomAccessFile`，避免共享文件指针。
+每个源文件开头一句话说明职责。首次用到 `ByteBuffer`、fsync 或 try-with-resources 时，注释简述其用途。SSTable 共享只读 FileChannel，各游标维护自己的偏移，用 `FileChannel.read(ByteBuffer, position)` 定位读取并处理短读。`ByteBuffer` 保存本次读出的字节，定位读允许多个读线程各自向前推进。
 
 ## 3. 数据路径和恢复
 
@@ -52,26 +54,27 @@ kvlite-java/
 
 1. 校验输入，构造 value 或 tombstone。
 2. 循环写完 WAL 帧，调用 `FileChannel.force(true)` 请求持久化文件数据及元数据。
-3. 更新 memtable。阶段 2 起，达到阈值时同步 flush。默认阈值草案为 1,024 个不同 key，包含 tombstone。仅反复改同一个 key 时 WAL 仍可能变大，显式 flush 可回收。
+3. 更新 memtable，按当前各条记录的 key 和 value 的 UTF-8 字节数之和估算大小。覆盖时先减旧条目再加新条目，tombstone 只计 key。从阶段 2 起，估算达到 4 MiB 或活动 WAL 文件达到 16 MiB（默认值，含 header 与帧开销）时同步 flush。反复覆盖一个 key 也会触发 WAL 上限。两项均在一条写入完成后检查，所以最多越过阈值一条记录。
 4. WAL 追加或同步失败时关闭写入路径并要求重新打开。调用者收到 I/O 错误时，重启后该操作可能已生效。自动 flush 失败也向调用者报告同样的结果不确定性，实例停止接收操作并允许关闭。
 
-阶段 1 使用 `wal-0000000000000000001.log`。启动时从 header 后顺序读完帧，按日志顺序重建 `TreeMap`。EOF 位于完整帧的末尾是正常结束。EOF 位于不足 8 字节的帧头中，或在通过帧头校验后出现在帧体或 CRC 内，允许截断至最近的完整帧位置并强制同步，然后才允许继续追加。完整帧的 CRC、非法长度或非法记录编码报错，保留原文件。保留从损坏处开始的字节有助于定位问题。成对损坏且恰好通过长度反码校验的长度字仍可能被当成截断，本格式无法可靠区分这种情况。
+阶段 1 从 manifest 找到活动 WAL。启动时从 header 后顺序读完帧，按日志顺序重建 `TreeMap`。EOF 位于完整帧的末尾是正常结束。EOF 位于不足 8 字节的帧头中，或在通过帧头校验后出现在帧体或 CRC 内，允许截断至最近的完整帧位置并强制同步，然后才允许继续追加。完整帧的 CRC、非法长度或非法记录编码报错，保留原文件。保留从损坏处开始的字节有助于定位问题。成对损坏且恰好通过长度反码校验的长度字仍可能被当成截断，本格式无法可靠区分这种情况。
 
 ### Flush 与提交点
 
-阶段 2 开始，manifest（当前文件集合的快照）决定启动时读哪些 SSTable 和哪一个 WAL。每份快照有递增编号，通过同目录临时文件发布到从未使用过的最终文件名。启动选择最高编号的最终 manifest，验证失败就报错。阶段 2 第一次打开阶段 1 的数据目录时，若还没有任何最终 manifest，就以阶段 1 的 WAL 为基础、空 SSTable 列表初始化第一份快照。创建新库时先建立并同步初始 WAL。发现最终 manifest 引用的文件缺失应报错。
+从阶段 1 起，启动选择编号最高的最终 manifest，校验格式、活动 WAL 和所有引用的表。缺失引用或校验失败即报错，保留现场。新建库先同步并发布初始 WAL，再通过同目录临时文件原子发布第一份 manifest（活动 WAL，空表列表），随后才接受写入。若没有最终 manifest，但已存在仅含合法 header 的初始 WAL，则沿用该文件，直接为它发布第一份 manifest。若只有建库临时文件，则创建并同步初始 WAL 后再发布 manifest。遇到含记录的 WAL 或最终 SSTable 则报错保留文件。
 
 1. 将 memtable 按 key 顺序写入临时 SSTable。同步文件、关闭文件句柄，然后原子移动到新的最终文件名。创建并同步一个只有 header 的新 WAL。
 2. 写入、同步并关闭新 manifest 的临时文件，再将其原子移动到新编号的最终文件名。这个移动是提交点。若文件系统不支持同目录原子移动，报错并停止发布。
 3. 提交后切换内存中的表集合和 WAL 句柄，清空 memtable。旧 WAL 及旧 manifest 在新状态确认生效后才允许清理。关闭旧文件句柄后再尝试清理。清理失败可保留文件待重试，读路径只认当前快照。
 
-提交前退出时，旧 manifest 仍引用旧 WAL，恢复会包含本次 memtable 的内容。提交后退出时，新 manifest 引用已发布的表和新 WAL。后续写入始终追加到新 WAL。启动忽略 `.tmp` 和快照未引用的表或日志，分配新编号时计入遗留文件，避免复用名字。空 memtable 的 flush 直接返回。设计和测试以本地盘上的进程退出为范围。文件同步加原子改名未建立跨平台的目录项断电持久化保证。 [Java 21 `FileChannel.force`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/channels/FileChannel.html#force(boolean)) · [Java 21 `Files.move`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/Files.html#move(java.nio.file.Path,java.nio.file.Path,java.nio.file.CopyOption...))
+提交前退出时，旧 manifest 仍引用旧 WAL，恢复会包含本次 memtable 的内容。提交后退出时，新 manifest 引用已发布的表和新 WAL。后续写入始终追加到新 WAL。启动完成当前快照及其引用文件的验证和 WAL 恢复后，删除符合引擎命名规则的临时文件、未被引用的 SSTable 和 WAL，以及更旧的 manifest。删除失败只记录文件名和原因，下次启动重试。分配编号时计入仍存在的文件。空 memtable 的 flush 直接返回。设计和测试以本地盘上的进程退出为范围。文件同步加原子改名未建立跨平台的目录项断电持久化保证。 [Java 21 `FileChannel.force`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/channels/FileChannel.html#force(boolean)) · [Java 21 `Files.move`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/Files.html#move(java.nio.file.Path,java.nio.file.Path,java.nio.file.CopyOption...))
 
 ### 点查找、范围与 compaction
 
 - 点查找先读 memtable，再从新到旧查 SSTable。每张表对索引做 floor 查找，跳到不大于目标的最近采样 key，再顺序读取到下一个采样点或数据区末尾。目标在第一个采样 key 之前时可直接返回缺失。
-- 范围扫描让每张表从 `fromInclusive` 对应的索引位置开始读，到 `toExclusive` 停止。按最旧 SSTable 到最新 SSTable、最后 memtable 的顺序，把记录覆盖写进一个临时 `TreeMap`。最后过滤 tombstone 并按 key 返回。扫描需要与该范围内不同 key 数量成正比的临时内存。
-- Compaction 将所有当前磁盘表按同样的「旧到新覆盖」规则合并。保留 tombstone 直到所有输入合并完成，再一次移除旧值和 tombstone。由于没有更旧的存活磁盘表，被删的值无法从旧表重新出现。memtable 和活动 WAL 保持原样，始终比结果表更新。合并后若没有值，提交空表列表。没有输入表时直接返回。沿用 flush 的 manifest 提交点，先发布结果，再切换快照，最后清理输入文件。内存上限受参与合并的不同 key 数量影响，运行期间会阻塞写入。
+- `MergingIterator` 为每个非空来源在优先队列中保留一条记录。按 key 升序、同 key 按来源从新到旧排序（memtable 最新，磁盘来源顺序取自 manifest）。取出队首作为胜者，消耗该 key 在所有来源中的记录，每消费一条就推进对应游标，再交付胜者。归并 N 条输入、k 个来源需 O(N log(k+1)) 时间，队列最多保留 k 条记录。
+- scan 将各来源限制在 `[fromInclusive, toExclusive)`，下界早于首个索引项时从首条开始。对胜者过滤 tombstone，只有最终可见的键值对进入返回的 List。
+- Compaction 对 manifest 的全部 SSTable 使用同一迭代器，把胜出的 value 逐条交给 `SSTableWriter`。胜出的 tombstone 可丢弃，因为这个 key 的全部旧磁盘版本已一并消费。活动 WAL 和 memtable 仍然最新。无输入时直接返回，全删时提交空表列表。沿用 manifest 提交点，发布成功后清理旧输入。归并内存主要是游标和队列，读写器还需要稀疏索引。阶段 4 的 compaction 全程持写锁，其他线程的读取和写入都要等待。
 
 ## 4. 文件格式草案
 
@@ -115,18 +118,18 @@ UTF-8 文本，行尾为 LF。首行固定 `KVMANIFEST 1`，第二行是活动 W
 | 阶段 | 交付 | 验收 |
 | --- | --- | --- |
 | 0 | 仅 `docs/PLAN.md` | 核对目录、接口、字节布局、提交点、测试矩阵和阶段边界。提交方案供用户与 Claude 审阅。 |
-| 1 | Maven、wrapper、CI、Memtable、WAL 和引擎恢复路径 | JUnit 5 测覆盖、删除、空值、Unicode、关闭重开。对一个完整 WAL 的最后一帧逐字节截断，验证只恢复完整前缀、截尾后可继续写。篡改完整末帧和中间帧 CRC、篡改单个长度字，验证打开失败且文件不变。 |
-| 2 | SSTable 读写、阈值与手动 flush、manifest、点读路径 | 覆盖稀疏索引两侧、空表、损坏 footer、较新 tombstone 遮挡旧值和跨表读。构造提交前后目录状态，验证重开、再次写入、再次 flush 及阶段 1 WAL 升级。 |
-| 3 | Compaction、range scan、模型对照 | 固定种子执行至少 5,000 步 `put/delete/get/flush/compact/scan`，加入重开。随机读与扫描逐次比对参考 `TreeMap`，每次 flush、compact 和重开后检查全量映射。失败输出 seed、步骤与操作。另测全删、重复覆盖、提交前后重开与 memtable 尚未 flush 的 compaction。 |
-| 4 | REPL、简单 Java benchmark、同实例并发、其余文档 | REPL 支持 `put/get/delete/scan/stats/compact`。使用一个 `ReadWriteLock`，读锁覆盖 get、scan、stats，写锁覆盖更新、flush、compact、close。scan 在锁内完成并返回结果副本。验证多线程写读和关闭行为，实跑并记录基准。 |
+| 1 | Maven、wrapper、CI、Memtable、WAL、最简 manifest 和引擎恢复路径 | 验证新建库中途退出可重试、首次写入前已有 manifest。JUnit 5 测覆盖、删除、空值、Unicode、关闭重开。对一个完整 WAL 的最后一帧逐字节截断，验证只恢复完整前缀、截尾后可继续写。篡改完整末帧和中间帧 CRC、篡改单个长度字，验证打开失败且文件不变。 |
+| 2 | SSTable 读写、阈值与手动 flush、manifest、点读路径 | 覆盖稀疏索引两侧、空表、损坏 footer、较新 tombstone 遮挡旧值和跨表读。构造提交前后目录状态，验证重开、再次写入、再次 flush。分别触发 4 MiB 内存估算和反复覆盖引起的 WAL 上限。验证提交前崩溃留下的孤儿表在重开后被清理，旧 WAL 中的值仍可读。 |
+| 3 | Compaction、range scan、模型对照 | 固定种子执行至少 5,000 步 `put/delete/get/flush/compact/scan`，加入重开。随机读与扫描逐次比对参考 `TreeMap`，每次 flush、compact 和重开后检查全量映射。失败输出 seed、步骤与操作。单测多来源同 key、空来源和 tombstone 胜出。另测全删、重复覆盖、提交前后重开与 memtable 尚未 flush 的 compaction。 |
+| 4 | REPL、简单 Java benchmark、同实例并发、其余文档 | REPL 支持 `put/get/delete/scan/stats/compact`。使用一个 `ReadWriteLock`，读锁覆盖 get、scan、stats，写锁覆盖更新、flush、compact、close。scan 在锁内完成并返回结果副本。验证 compaction 持写锁时其他读者和写者均须等待。验证多线程写读和关闭行为，实跑并记录基准。 |
 
-阶段 1 起，GitHub Actions 在 push 时用 JDK 21 跑 `./mvnw verify`，可同时在 PR 上运行。Windows 本地对应 `.\mvnw.cmd verify`。Wrapper 固定 Maven 版本。JUnit 5 是测试依赖，JaCoCo、编译器和测试运行器属于构建插件，运行时只依赖 JDK。每个可执行组件有对应单元测试，JaCoCo 在 `verify` 检查整个主代码的行覆盖率至少 85%。以后每阶段 PR 都列出改动、阅读顺序、实际测试结果和假设。用户与 Claude 审阅确认后再进入下一阶段。 [Apache Maven Wrapper](https://maven.apache.org/tools/wrapper/)
+阶段 1 起，GitHub Actions 在 `push` 和 `pull_request` 时用 JDK 21 跑 `./mvnw verify`。Windows 本地对应 `.\mvnw.cmd verify`。Wrapper 固定 Maven 版本。JUnit 5 是测试依赖，JaCoCo、编译器和测试运行器属于构建插件，运行时只依赖 JDK。每个可执行组件有对应单元测试，JaCoCo 在 `verify` 检查主代码行覆盖率至少 85%，仅排除 `Benchmark.main`。将 Benchmark 类限制为只有 main 的入口，实际负载与统计放在单独受检查的类中，便于按类设置排除。以后每阶段 PR 都列出改动、阅读顺序、实际测试结果和假设。用户与 Claude 审阅确认后再进入下一阶段。 [Apache Maven Wrapper](https://maven.apache.org/tools/wrapper/)
 
 ## 6. 阶段 4 文档和基准清单
 
 - `README.md` 包含一句话介绍、架构图、JDK 21 安装前提和运行命令、示例 REPL 会话、测试和 CI、实测 benchmark。
 - `ARCHITECTURE.md` 包含 Mermaid 写入与读取流程图及模块职责。`FILE_FORMAT.md` 将实际实现与字节布局逐项核对。
-- `DECISIONS.md` 至少写 8 条。候选主题为有序内存结构、按条同步、截断与 CRC 策略、稀疏索引间距、快照提交、tombstone 生命周期、范围合并、全量 compaction 和读写锁。每条记录动机、可行替代方案、代价及局限。
+- `DECISIONS.md` 至少写 8 条。候选主题为有序内存结构、按条同步、截断与 CRC 策略、稀疏索引间距、快照提交、tombstone 生命周期、范围合并、全量 compaction 和读写锁。WAL 决策要对比“末条完整帧 CRC 错也截断”：这种策略能继续打开库，却可能静默丢弃已确认写入。进程退出模型下，仅自动修复物理不完整的尾帧；完整帧 CRC 错时保留文件并报告损坏。记录采用 16 MiB WAL 上限的代价：反复覆盖同一 key 会触发 flush，产生只含一个 key 的小 SSTable。compaction 保留最新版本并回收旧表。每条记录动机、可行替代方案、代价及局限。
 - `INTERVIEW_NOTES.md` 以英文为主，算法要点附中文，包含 30 秒和 2 分钟介绍、恢复和 compaction 讲解稿、12 个有参考答案的问题及 3 条基于实际实现的简历 bullet。问题覆盖 LSM vs B-tree、写放大、WAL、fsync 代价和并发。
 - `READING_GUIDE.md` 用中文给出从 API 到持久化再到测试的顺序，每步写明读懂的标志。Maven 小节讲清 JDK、Wrapper、`pom.xml`、`test` 与 `verify`，以及在哪里读测试和覆盖率报告。
 - `Benchmark` 用固定 seed 和临时数据目录，先预热，再分开测量写入与随机点读。读取负载在显式 flush 后运行并记录命中率。用 `System.nanoTime()` 计时，报告 ops/s、CPU、内存、磁盘、OS、JDK、数据量、阈值、同步策略、计时边界及缓存条件。报告实际跑出的结果，必要时多次运行并注明汇总方法。
