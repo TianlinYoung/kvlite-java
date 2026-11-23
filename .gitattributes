@@ -1,0 +1,3 @@
+# Keep the Unix wrapper executable across Windows checkouts.
+mvnw text eol=lf
+mvnw.cmd text eol=crlf
