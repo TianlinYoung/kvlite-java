@@ -15,6 +15,7 @@ import static java.nio.file.StandardCopyOption.ATOMIC_MOVE;
 import static java.nio.file.StandardOpenOption.*;
 
 record TableSet(Path manifest, Path wal) {
+    // The negative lookahead (?!0{19}) excludes generation zero.
     private static final String ID = "(?!0{19})[0-9]{19}";
     private static final Pattern MANIFEST = Pattern.compile("manifest-" + ID + "[.]txt");
     private static final Pattern LOG = Pattern.compile("wal-" + ID + "[.]log");

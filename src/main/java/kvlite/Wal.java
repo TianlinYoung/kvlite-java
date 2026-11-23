@@ -11,6 +11,8 @@ import java.util.Arrays;
 import java.util.zip.CRC32;
 
 final class Wal implements Closeable {
+    private static final int FRAME_PREFIX = 2 * Integer.BYTES;
+    private static final int CRC_BYTES = Integer.BYTES;
     static final byte[] HEADER = {'K', 'V', 'W', 'L', 0, 0, 0, 1};
     private final FileChannel file;
 
@@ -25,22 +27,25 @@ final class Wal implements Closeable {
         long end = file.size();
         while (file.position() < end) {
             long start = file.position();
-            if (end - start < 8) {
+            // A process can stop midway through the prefix, leaving only its first bytes.
+            if (end - start < FRAME_PREFIX) {
                 discardTail(start);
                 return;
             }
-            byte[] prefix = read(8);
+            byte[] prefix = read(FRAME_PREFIX);
             ByteBuffer lengths = ByteBuffer.wrap(prefix);
             int length = lengths.getInt();
             if (lengths.getInt() != ~length || length < EntryCodec.HEADER || length > EntryCodec.MAX_BODY) {
                 throw new IOException("Invalid WAL length at " + start);
             }
-            if (end - file.position() < length + 4L) {
+            if (end - file.position() < length + CRC_BYTES) {
+                // A valid prefix can outlive an unfinished body or checksum.
                 discardTail(start);
                 return;
             }
             byte[] body = read(length);
-            if (ByteBuffer.wrap(read(4)).getInt() != checksum(prefix, body)) {
+            if (ByteBuffer.wrap(read(CRC_BYTES)).getInt() != checksum(prefix, body)) {
+                // A process crash can omit trailing bytes; a complete frame with a bad CRC indicates corruption.
                 throw new IOException("CRC mismatch at " + start);
             }
             try {
@@ -49,11 +54,12 @@ final class Wal implements Closeable {
                 throw new IOException("Invalid WAL record at " + start, e);
             }
         }
+        // EOF on a frame boundary means every available record has been replayed.
     }
 
     void append(byte[] body) throws IOException {
-        byte[] prefix = ByteBuffer.allocate(8).putInt(body.length).putInt(~body.length).array();
-        ByteBuffer frame = ByteBuffer.allocate(12 + body.length)
+        byte[] prefix = ByteBuffer.allocate(FRAME_PREFIX).putInt(body.length).putInt(~body.length).array();
+        ByteBuffer frame = ByteBuffer.allocate(FRAME_PREFIX + body.length + CRC_BYTES)
                 .put(prefix).put(body).putInt(checksum(prefix, body)).flip();
         while (frame.hasRemaining()) {
             file.write(frame);
@@ -74,6 +80,7 @@ final class Wal implements Closeable {
 
     private void discardTail(long start) throws IOException {
         file.truncate(start);
+        file.position(start);
         file.force(true);
     }
 

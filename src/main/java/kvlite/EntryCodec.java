@@ -55,11 +55,18 @@ final class EntryCodec {
         int kind = in.get();
         int keyLength = in.getInt();
         int valueLength = in.getInt();
-        if (keyLength < 0 || keyLength > MAX_KEY
-                || !(kind == 1 && valueLength >= 0 && valueLength <= MAX_VALUE
-                     || kind == 2 && valueLength == -1)
-                || in.remaining() != keyLength + Math.max(0, valueLength)) {
-            throw new IOException("Invalid entry type or lengths");
+        boolean knownKind = kind == 1 || kind == 2;
+        if (!knownKind) {
+            throw new IOException("Unknown entry type: " + kind);
+        }
+        boolean validKeyLength = keyLength >= 0 && keyLength <= MAX_KEY;
+        boolean validValueLength = kind == 2 ? valueLength == -1 : valueLength >= 0 && valueLength <= MAX_VALUE;
+        if (!validKeyLength || !validValueLength) {
+            throw new IOException("Invalid lengths for type " + kind + ": key=" + keyLength + ", value=" + valueLength);
+        }
+        int expectedBytes = keyLength + Math.max(0, valueLength);
+        if (in.remaining() != expectedBytes) {
+            throw new IOException("Expected " + expectedBytes + " payload bytes, found " + in.remaining());
         }
         String key = readString(in, keyLength);
         return kind == 2 ? Entry.delete(key) : Entry.put(key, readString(in, valueLength));

@@ -5,7 +5,10 @@ permissions:
   contents: read
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -13,14 +16,16 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
-      - run: ./mvnw verify
+      - if: runner.os == 'Linux'
+        run: ./mvnw verify
+      - if: runner.os == 'Windows'
+        run: .\mvnw.cmd verify
       - name: Report line coverage
+        shell: python
         run: |
-          python3 - <<'PY'
           import xml.etree.ElementTree as ET
           report = ET.parse('target/site/jacoco/jacoco.xml')
           lines = report.find("./counter[@type='LINE']")
           covered = int(lines.get('covered'))
           total = covered + int(lines.get('missed'))
           print(f"Line coverage: {covered}/{total} ({covered / total:.2%})")
-          PY

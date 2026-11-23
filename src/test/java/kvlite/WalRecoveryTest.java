@@ -60,6 +60,26 @@ class WalRecoveryTest {
         assertRejected(wal, Arrays.copyOf(valid, 7));
     }
 
+    @Test void knownLimitationMatchingInflatedLengthsLookLikeAnIncompleteTail() throws IOException {
+        Path wal = TableSet.open(dir).wal();
+        int lastFrame;
+        try (Storage db = LsmStorage.open(dir)) {
+            db.put("k", "old");
+            lastFrame = Math.toIntExact(Files.size(wal));
+            db.put("k", "new");
+        }
+        byte[] bytes = Files.readAllBytes(wal);
+        ByteBuffer frame = ByteBuffer.wrap(bytes);
+        int inflated = frame.getInt(lastFrame) + 1;
+        frame.putInt(lastFrame, inflated).putInt(lastFrame + Integer.BYTES, ~inflated);
+        Files.write(wal, bytes);
+
+        try (Storage db = LsmStorage.open(dir)) {
+            assertEquals(Optional.of("old"), db.get("k"));
+            assertArrayEquals(Arrays.copyOf(bytes, lastFrame), Files.readAllBytes(wal));
+        }
+    }
+
     @Test void validCrcDoesNotExcuseInvalidEncoding() throws IOException {
         Path wal = TableSet.open(dir).wal();
         try (Storage db = LsmStorage.open(dir)) {
