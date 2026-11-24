@@ -7,10 +7,14 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Supplier;
 
 public final class LsmStorage implements Storage {
     private static final long MEMTABLE_LIMIT = 4L * 1024 * 1024;
     private static final long WAL_LIMIT = 16L * 1024 * 1024;
+    private final ReadWriteLock lock;
     private Wal wal;
     private TableSet files;
     private Memtable table = new Memtable();
@@ -18,8 +22,13 @@ public final class LsmStorage implements Storage {
     private boolean closed;
 
     public static LsmStorage open(Path directory) throws IOException {
+        return open(directory, new ReentrantReadWriteLock());
+    }
+
+    // The caller gains access only after recovery finishes and the store is fully initialized.
+    static LsmStorage open(Path directory, ReadWriteLock lock) throws IOException {
         TableSet files = TableSet.open(directory.toAbsolutePath());
-        var storage = new LsmStorage(files);
+        var storage = new LsmStorage(files, lock);
         try {
             for (Path path : files.tables()) {
                 storage.readers.add(new FileSSTableReader(path));
@@ -33,25 +42,29 @@ public final class LsmStorage implements Storage {
         return storage;
     }
 
-    private LsmStorage(TableSet files) throws IOException {
+    private LsmStorage(TableSet files, ReadWriteLock lock) throws IOException {
+        this.lock = lock;
         this.files = files;
         this.wal = new Wal(files.wal());
     }
 
     @Override
     public void put(String key, String value) throws IOException {
-        write(Entry.put(key, value));
+        write(() -> Entry.put(key, value));
     }
 
     @Override
     public void delete(String key) throws IOException {
-        write(Entry.delete(key));
+        write(() -> Entry.delete(key));
     }
 
-    private void write(Entry entry) throws IOException {
-        requireOpen();
-        byte[] body = EntryCodec.encode(entry);
+    private void write(Supplier<Entry> update) throws IOException {
+        var writeLock = lock.writeLock();
+        writeLock.lock();
         try {
+            requireOpen();
+            Entry entry = update.get();
+            byte[] body = EntryCodec.encode(entry);
             wal.append(body);
             table.apply(entry);
             if (table.encodedBytes() >= MEMTABLE_LIMIT || wal.size() >= WAL_LIMIT) {
@@ -61,11 +74,23 @@ public final class LsmStorage implements Storage {
             // Reopen to resolve a partial append or an uncertain flush commit.
             closeAfterFailure(e);
             throw e;
+        } finally {
+            writeLock.unlock();
         }
     }
 
     @Override
     public Optional<String> get(String key) throws IOException {
+        var readLock = lock.readLock();
+        readLock.lock();
+        try {
+            return getLocked(key);
+        } finally {
+            readLock.unlock();
+        }
+    }
+
+    private Optional<String> getLocked(String key) throws IOException {
         requireOpen();
         EntryCodec.keyBytes(key);
         Entry entry = table.get(key);
@@ -84,6 +109,18 @@ public final class LsmStorage implements Storage {
 
     @Override
     public List<Map.Entry<String, String>> scan(String fromInclusive, String toExclusive) throws IOException {
+        var readLock = lock.readLock();
+        readLock.lock();
+        try {
+            // Finish reading the shared sources and copy the result before a writer can change them.
+            return scanLocked(fromInclusive, toExclusive);
+        } finally {
+            readLock.unlock();
+        }
+    }
+
+    private List<Map.Entry<String, String>> scanLocked(String fromInclusive, String toExclusive)
+            throws IOException {
         requireOpen();
         EntryCodec.keyBytes(fromInclusive);
         EntryCodec.keyBytes(toExclusive);
@@ -110,13 +147,29 @@ public final class LsmStorage implements Storage {
     }
 
     @Override
-    public void flush() throws IOException {
-        requireOpen();
+    public Stats stats() throws IOException {
+        var readLock = lock.readLock();
+        readLock.lock();
         try {
+            requireOpen();
+            return new Stats(readers.size(), table.encodedBytes(), wal.size());
+        } finally {
+            readLock.unlock();
+        }
+    }
+
+    @Override
+    public void flush() throws IOException {
+        var writeLock = lock.writeLock();
+        writeLock.lock();
+        try {
+            requireOpen();
             flushTable();
         } catch (IOException e) {
             closeAfterFailure(e);
             throw e;
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -151,16 +204,19 @@ public final class LsmStorage implements Storage {
 
     @Override
     public void compact() throws IOException {
-        requireOpen();
-        if (readers.isEmpty()) {
-            return;
-        }
+        var writeLock = lock.writeLock();
+        writeLock.lock();
         try {
-            compactTables();
+            requireOpen();
+            if (!readers.isEmpty()) {
+                compactTables();
+            }
         } catch (IOException e) {
             // Reopen to select the committed generation and retry orphan cleanup.
             closeAfterFailure(e);
             throw e;
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -193,7 +249,8 @@ public final class LsmStorage implements Storage {
 
     private void closeAfterFailure(IOException failure) {
         try {
-            close();
+            // Only called during open or by a writer. Never upgrade a read lock to close.
+            closeResources();
         } catch (IOException closeError) {
             failure.addSuppressed(closeError);
         }
@@ -201,6 +258,16 @@ public final class LsmStorage implements Storage {
 
     @Override
     public void close() throws IOException {
+        var writeLock = lock.writeLock();
+        writeLock.lock();
+        try {
+            closeResources();
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    private void closeResources() throws IOException {
         closed = true;
         IOException failure = null;
         try {
