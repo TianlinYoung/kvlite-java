@@ -1,19 +1,28 @@
-// Coordinate the WAL and memtable for a single owner of a data directory.
+// Coordinate WAL writes, atomic flushes and newest-first lookups for one store.
 package kvlite;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Optional;
+import java.util.ArrayList;
+import java.util.List;
 
 public final class LsmStorage implements Storage {
-    private final Wal wal;
-    private final Memtable table = new Memtable();
+    private static final long MEMTABLE_LIMIT = 4L * 1024 * 1024;
+    private static final long WAL_LIMIT = 16L * 1024 * 1024;
+    private Wal wal;
+    private TableSet files;
+    private Memtable table = new Memtable();
+    private final List<SSTableReader> readers = new ArrayList<>();
     private boolean closed;
 
     public static LsmStorage open(Path directory) throws IOException {
         TableSet files = TableSet.open(directory.toAbsolutePath());
-        var storage = new LsmStorage(new Wal(files.wal()));
+        var storage = new LsmStorage(files);
         try {
+            for (Path path : files.tables()) {
+                storage.readers.add(new FileSSTableReader(path));
+            }
             storage.wal.replay(storage.table);
         } catch (IOException e) {
             storage.closeAfterFailure(e);
@@ -23,8 +32,9 @@ public final class LsmStorage implements Storage {
         return storage;
     }
 
-    private LsmStorage(Wal wal) {
-        this.wal = wal;
+    private LsmStorage(TableSet files) throws IOException {
+        this.files = files;
+        this.wal = new Wal(files.wal());
     }
 
     @Override
@@ -42,19 +52,73 @@ public final class LsmStorage implements Storage {
         byte[] body = EntryCodec.encode(entry);
         try {
             wal.append(body);
+            table.apply(entry);
+            if (table.encodedBytes() >= MEMTABLE_LIMIT || wal.size() >= WAL_LIMIT) {
+                flushTable();
+            }
         } catch (IOException e) {
-            // A partial append makes subsequent writes unsafe until replay.
+            // Reopen to resolve a partial append or an uncertain flush commit.
             closeAfterFailure(e);
             throw e;
         }
-        table.apply(entry);
     }
 
     @Override
-    public Optional<String> get(String key) {
+    public Optional<String> get(String key) throws IOException {
         requireOpen();
         EntryCodec.keyBytes(key);
-        return table.get(key);
+        Entry entry = table.get(key);
+        if (entry != null) {
+            return entry.value();
+        }
+        for (SSTableReader reader : readers) {
+            entry = reader.get(key);
+            if (entry != null) {
+                // A tombstone is a hit: an older value must stay hidden.
+                return entry.value();
+            }
+        }
+        return Optional.empty();
+    }
+
+    @Override
+    public void flush() throws IOException {
+        requireOpen();
+        try {
+            flushTable();
+        } catch (IOException e) {
+            closeAfterFailure(e);
+            throw e;
+        }
+    }
+
+    private void flushTable() throws IOException {
+        if (table.isEmpty()) {
+            return;
+        }
+        TableSet next = files.afterFlush();
+        Path newest = next.tables().getFirst();
+
+        // 1. Publish the table while the old WAL can still recover the memtable.
+        SSTableWriter.write(newest, table.sortedEntries());
+
+        // 2. Publish the empty WAL so the next manifest can reference an existing log.
+        next.publishEmptyWal();
+
+        // 3. Atomically publish the manifest. Recovery now selects the new table and WAL.
+        next.commit();
+
+        // 4. Switch the live state to the committed generation before accepting more writes.
+        wal.close();
+        wal = new Wal(next.wal());
+        table = new Memtable();
+        // Replay validates the header and positions the first append just after it.
+        wal.replay(table);
+        readers.addFirst(new FileSSTableReader(newest));
+        files = next;
+
+        // 5. Retire old files after the commit and after closing the old WAL handle.
+        files.cleanOrphans();
     }
 
     private void requireOpen() {
@@ -74,6 +138,25 @@ public final class LsmStorage implements Storage {
     @Override
     public void close() throws IOException {
         closed = true;
-        wal.close();
+        IOException failure = null;
+        try {
+            wal.close();
+        } catch (IOException e) {
+            failure = e;
+        }
+        for (SSTableReader reader : readers) {
+            try {
+                reader.close();
+            } catch (IOException e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 }

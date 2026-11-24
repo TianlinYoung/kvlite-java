@@ -55,6 +55,15 @@ final class EntryCodec {
         int kind = in.get();
         int keyLength = in.getInt();
         int valueLength = in.getInt();
+        int expectedBytes = payloadLength(kind, keyLength, valueLength);
+        if (in.remaining() != expectedBytes) {
+            throw new IOException("Expected " + expectedBytes + " payload bytes, found " + in.remaining());
+        }
+        String key = readString(in, keyLength);
+        return kind == 2 ? Entry.delete(key) : Entry.put(key, readString(in, valueLength));
+    }
+
+    static int payloadLength(int kind, int keyLength, int valueLength) throws IOException {
         boolean knownKind = kind == 1 || kind == 2;
         if (!knownKind) {
             throw new IOException("Unknown entry type: " + kind);
@@ -64,12 +73,7 @@ final class EntryCodec {
         if (!validKeyLength || !validValueLength) {
             throw new IOException("Invalid lengths for type " + kind + ": key=" + keyLength + ", value=" + valueLength);
         }
-        int expectedBytes = keyLength + Math.max(0, valueLength);
-        if (in.remaining() != expectedBytes) {
-            throw new IOException("Expected " + expectedBytes + " payload bytes, found " + in.remaining());
-        }
-        String key = readString(in, keyLength);
-        return kind == 2 ? Entry.delete(key) : Entry.put(key, readString(in, valueLength));
+        return keyLength + Math.max(0, valueLength);
     }
 
     private static String readString(ByteBuffer in, int length) throws IOException {

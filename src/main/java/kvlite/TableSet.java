@@ -1,4 +1,4 @@
-// Select the committed manifest and publish the first WAL before accepting writes.
+// Publish and recover the manifest that names the live WAL and newest-first disk tables.
 package kvlite;
 
 import java.io.IOException;
@@ -9,12 +9,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Locale;
+import java.math.BigInteger;
 import java.util.regex.Pattern;
 
 import static java.nio.file.StandardCopyOption.ATOMIC_MOVE;
 import static java.nio.file.StandardOpenOption.*;
 
-record TableSet(Path manifest, Path wal) {
+record TableSet(Path manifest, Path wal, List<Path> tables) {
     // The negative lookahead (?!0{19}) excludes generation zero.
     private static final String ID = "(?!0{19})[0-9]{19}";
     private static final Pattern MANIFEST = Pattern.compile("manifest-" + ID + "[.]txt");
@@ -31,11 +35,19 @@ record TableSet(Path manifest, Path wal) {
         if (latest.isPresent()) {
             Path manifest = dir.resolve(latest.get());
             String[] lines = Files.readString(manifest).split("\n", -1);
-            if (lines.length != 3 || !lines[0].equals("KVMANIFEST 1")
-                    || !LOG.matcher(lines[1]).matches() || !lines[2].isEmpty()) {
+            if (lines.length < 3 || !lines[0].equals("KVMANIFEST 1")
+                    || !LOG.matcher(lines[1]).matches() || !lines[lines.length - 1].isEmpty()) {
                 throw new IOException("Invalid or unsupported manifest: " + manifest);
             }
-            return new TableSet(manifest, dir.resolve(lines[1]));
+            var tables = new ArrayList<Path>();
+            var seen = new HashSet<String>();
+            for (int i = 2; i < lines.length - 1; i++) {
+                if (!TABLE.matcher(lines[i]).matches() || !seen.add(lines[i])) {
+                    throw new IOException("Invalid or duplicate table: " + lines[i]);
+                }
+                tables.add(dir.resolve(lines[i]));
+            }
+            return new TableSet(manifest, dir.resolve(lines[1]), List.copyOf(tables));
         }
 
         Path wal = dir.resolve("wal-" + FIRST + ".log");
@@ -54,7 +66,40 @@ record TableSet(Path manifest, Path wal) {
         }
         Path manifest = dir.resolve("manifest-" + FIRST + ".txt");
         publish(manifest, (MAGIC + wal.getFileName() + "\n").getBytes(StandardCharsets.UTF_8));
-        return new TableSet(manifest, wal);
+        return new TableSet(manifest, wal, List.of());
+    }
+
+    TableSet afterFlush() throws IOException {
+        Path dir = manifest.getParent();
+        // A 19-digit generation can exceed Long.MAX_VALUE.
+        BigInteger max = BigInteger.ZERO;
+        // An interrupted publication or failed cleanup can leave higher generations on disk.
+        for (String name : names(dir)) {
+            String stem = name.endsWith(".tmp") ? name.substring(0, name.length() - 4) : name;
+            if (LOG.matcher(stem).matches() || MANIFEST.matcher(stem).matches() || TABLE.matcher(stem).matches()) {
+                String digits = stem.substring(stem.indexOf('-') + 1, stem.indexOf('.'));
+                max = max.max(new BigInteger(digits));
+            }
+        }
+        String id = String.format(Locale.ROOT, "%019d", max.add(BigInteger.ONE));
+        if (id.length() > 19) {
+            throw new IOException("Generation space exhausted");
+        }
+        var next = new ArrayList<>(tables);
+        next.addFirst(dir.resolve("sst-" + id + ".sst"));
+        return new TableSet(dir.resolve("manifest-" + id + ".txt"), dir.resolve("wal-" + id + ".log"), List.copyOf(next));
+    }
+
+    void publishEmptyWal() throws IOException {
+        publish(wal, Wal.HEADER);
+    }
+
+    void commit() throws IOException {
+        var text = new StringBuilder(MAGIC).append(wal.getFileName()).append('\n');
+        for (Path table : tables) {
+            text.append(table.getFileName()).append('\n');
+        }
+        publish(manifest, text.toString().getBytes(StandardCharsets.UTF_8));
     }
 
     private static List<String> names(Path dir) throws IOException {
@@ -82,7 +127,7 @@ record TableSet(Path manifest, Path wal) {
             for (String name : names(dir)) {
                 Path path = dir.resolve(name);
                 String stem = name.endsWith(".tmp") ? name.substring(0, name.length() - 4) : name;
-                if (path.equals(manifest) || path.equals(wal)
+                if (path.equals(manifest) || path.equals(wal) || tables.contains(path)
                         || !(LOG.matcher(stem).matches() || MANIFEST.matcher(stem).matches()
                              || TABLE.matcher(stem).matches())) {
                     continue;
