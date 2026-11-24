@@ -9,6 +9,7 @@ import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Objects;
 
 import static java.nio.file.StandardCopyOption.ATOMIC_MOVE;
 import static java.nio.file.StandardOpenOption.*;
@@ -21,6 +22,22 @@ final class SSTableWriter {
     static final int STRIDE = 32;
 
     static void write(Path target, Iterable<Entry> records) throws IOException {
+        var iterator = records.iterator();
+        EntrySource source = () -> iterator.hasNext() ? Objects.requireNonNull(iterator.next()) : null;
+        write(target, source.next(), source);
+    }
+
+    static boolean writeIfNotEmpty(Path target, EntrySource records) throws IOException {
+        // All-tombstone compaction needs only a new manifest.
+        Entry first = records.next();
+        if (first == null) {
+            return false;
+        }
+        write(target, first, records);
+        return true;
+    }
+
+    private static void write(Path target, Entry first, EntrySource records) throws IOException {
         Path temp = target.resolveSibling(target.getFileName() + ".tmp");
         try (var file = FileChannel.open(temp, CREATE_NEW, WRITE);
              var out = new DataOutputStream(new BufferedOutputStream(Channels.newOutputStream(file)))) {
@@ -32,7 +49,7 @@ final class SSTableWriter {
             long count = 0;
             int samples = 0;
             String previous = null;
-            for (Entry entry : records) {
+            for (Entry entry = first; entry != null; entry = records.next()) {
                 if (previous != null && previous.compareTo(entry.key()) >= 0) {
                     throw new IOException("SSTable keys must be unique and increasing");
                 }

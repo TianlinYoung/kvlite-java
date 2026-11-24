@@ -71,6 +71,20 @@ record TableSet(Path manifest, Path wal, List<Path> tables) {
 
     TableSet afterFlush() throws IOException {
         Path dir = manifest.getParent();
+        String id = nextGeneration();
+        var next = new ArrayList<>(tables);
+        next.addFirst(dir.resolve("sst-" + id + ".sst"));
+        return new TableSet(dir.resolve("manifest-" + id + ".txt"), dir.resolve("wal-" + id + ".log"), List.copyOf(next));
+    }
+
+    TableSet afterCompaction() throws IOException {
+        Path dir = manifest.getParent();
+        String id = nextGeneration();
+        return new TableSet(dir.resolve("manifest-" + id + ".txt"), wal, List.of(dir.resolve("sst-" + id + ".sst")));
+    }
+
+    private String nextGeneration() throws IOException {
+        Path dir = manifest.getParent();
         // A 19-digit generation can exceed Long.MAX_VALUE.
         BigInteger max = BigInteger.ZERO;
         // An interrupted publication or failed cleanup can leave higher generations on disk.
@@ -85,9 +99,7 @@ record TableSet(Path manifest, Path wal, List<Path> tables) {
         if (id.length() > 19) {
             throw new IOException("Generation space exhausted");
         }
-        var next = new ArrayList<>(tables);
-        next.addFirst(dir.resolve("sst-" + id + ".sst"));
-        return new TableSet(dir.resolve("manifest-" + id + ".txt"), dir.resolve("wal-" + id + ".log"), List.copyOf(next));
+        return id;
     }
 
     void publishEmptyWal() throws IOException {

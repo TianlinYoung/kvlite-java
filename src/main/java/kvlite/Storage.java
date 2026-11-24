@@ -3,11 +3,15 @@ package kvlite;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 public interface Storage extends Closeable {
     void put(String key, String value) throws IOException;
     Optional<String> get(String key) throws IOException;
+    List<Map.Entry<String, String>> scan(String fromInclusive, String toExclusive) throws IOException;
     void flush() throws IOException;
+    void compact() throws IOException;
     void delete(String key) throws IOException;
 }

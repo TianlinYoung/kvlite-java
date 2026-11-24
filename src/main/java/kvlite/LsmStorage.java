@@ -1,11 +1,12 @@
-// Coordinate WAL writes, atomic flushes and newest-first lookups for one store.
+// Coordinate WAL writes, reads and manifest publication for one store.
 package kvlite;
 
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.Optional;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 public final class LsmStorage implements Storage {
     private static final long MEMTABLE_LIMIT = 4L * 1024 * 1024;
@@ -82,6 +83,32 @@ public final class LsmStorage implements Storage {
     }
 
     @Override
+    public List<Map.Entry<String, String>> scan(String fromInclusive, String toExclusive) throws IOException {
+        requireOpen();
+        EntryCodec.keyBytes(fromInclusive);
+        EntryCodec.keyBytes(toExclusive);
+        int order = fromInclusive.compareTo(toExclusive);
+        if (order > 0) {
+            throw new IllegalArgumentException("Scan lower bound exceeds upper bound");
+        }
+        if (order == 0) {
+            return List.of();
+        }
+
+        var sources = new ArrayList<EntrySource>();
+        sources.add(table.range(fromInclusive, toExclusive));
+        for (SSTableReader reader : readers) {
+            sources.add(reader.range(fromInclusive, toExclusive));
+        }
+        var merged = new MergingIterator(sources);
+        var visible = new ArrayList<Map.Entry<String, String>>();
+        for (Entry winner = merged.nextValue(); winner != null; winner = merged.nextValue()) {
+            visible.add(Map.entry(winner.key(), winner.value().orElseThrow()));
+        }
+        return visible;
+    }
+
+    @Override
     public void flush() throws IOException {
         requireOpen();
         try {
@@ -121,6 +148,42 @@ public final class LsmStorage implements Storage {
         files.cleanOrphans();
     }
 
+    @Override
+    public void compact() throws IOException {
+        requireOpen();
+        if (readers.isEmpty()) {
+            return;
+        }
+        try {
+            compactTables();
+        } catch (IOException e) {
+            // Reopen to select the committed generation and retry orphan cleanup.
+            closeAfterFailure(e);
+            throw e;
+        }
+    }
+
+    private void compactTables() throws IOException {
+        // Merge every disk version before dropping tombstones. The memtable stays above the result.
+        var merged = new MergingIterator(readers.stream().map(SSTableReader::entries).toList());
+        TableSet next = files.afterCompaction();
+        Path output = next.tables().getFirst();
+        boolean hasValues = SSTableWriter.writeIfNotEmpty(output, merged::nextValue);
+        if (!hasValues) {
+            next = new TableSet(next.manifest(), next.wal(), List.of());
+        }
+
+        // The old tables remain recoverable until the replacement manifest is published.
+        next.commit();
+        closeReaders();
+        if (hasValues) {
+            readers.add(new FileSSTableReader(output));
+        }
+        files = next;
+        // Close the input handles first so Windows can remove the retired tables.
+        files.cleanOrphans();
+    }
+
     private void requireOpen() {
         if (closed) {
             throw new IllegalStateException("Storage is closed");
@@ -144,6 +207,22 @@ public final class LsmStorage implements Storage {
         } catch (IOException e) {
             failure = e;
         }
+        try {
+            closeReaders();
+        } catch (IOException e) {
+            if (failure == null) {
+                failure = e;
+            } else {
+                failure.addSuppressed(e);
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    private void closeReaders() throws IOException {
+        IOException failure = null;
         for (SSTableReader reader : readers) {
             try {
                 reader.close();
@@ -158,5 +237,6 @@ public final class LsmStorage implements Storage {
         if (failure != null) {
             throw failure;
         }
+        readers.clear();
     }
 }
