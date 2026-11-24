@@ -95,6 +95,7 @@ public final class LsmStorage implements Storage {
             return List.of();
         }
 
+        // Source order breaks ties: memtable first, then disk tables in newest-first manifest order.
         var sources = new ArrayList<EntrySource>();
         sources.add(table.range(fromInclusive, toExclusive));
         for (SSTableReader reader : readers) {
@@ -105,7 +106,7 @@ public final class LsmStorage implements Storage {
         for (Entry winner = merged.nextValue(); winner != null; winner = merged.nextValue()) {
             visible.add(Map.entry(winner.key(), winner.value().orElseThrow()));
         }
-        return visible;
+        return List.copyOf(visible);
     }
 
     @Override

@@ -47,6 +47,7 @@ class ScanTest {
             db.put("\ue000", "private");
 
             var snapshot = db.scan("", "\uffff");
+            assertThrows(UnsupportedOperationException.class, () -> snapshot.add(Map.entry("extra", "value")));
             db.delete("shared");
             assertEquals(List.of(Map.entry("", ""), Map.entry("shared", "memory"),
                     Map.entry("😀", "emoji"), Map.entry("\ue000", "private")), snapshot);

@@ -123,6 +123,48 @@ class CompactionTest {
         }
     }
 
+    @Test void corruptInputClosesStoreWithoutPublishingAndCanBeRetried() throws IOException {
+        Entry first = Entry.put("a", "first");
+        Entry second = Entry.put("b", "second");
+        try (Storage db = LsmStorage.open(dir)) {
+            db.put(first.key(), first.value().orElseThrow());
+            db.put(second.key(), second.value().orElseThrow());
+            db.put("c", "third");
+            db.flush();
+            db.put("z", "newer table");
+            db.flush();
+        }
+        TableSet before = TableSet.open(dir);
+        Path input = before.tables().getLast();
+        byte[] original = Files.readAllBytes(input);
+        byte[] damaged = original.clone();
+        // Only the first record is sampled. Damage the third so streaming output has already begun.
+        int thirdKind = SSTableWriter.HEADER_BYTES + EntryCodec.encode(first).length
+                + EntryCodec.encode(second).length;
+        damaged[thirdKind] = 0;
+        Files.write(input, damaged);
+
+        try (Storage db = LsmStorage.open(dir)) {
+            assertEquals(Optional.of("newer table"), db.get("z"));
+            assertThrows(IOException.class, db::compact);
+            assertThrows(IllegalStateException.class, () -> db.get("z"));
+            assertEquals(before, TableSet.open(dir));
+            assertArrayEquals(damaged, Files.readAllBytes(input));
+        }
+
+        Files.write(input, original);
+        try (Storage db = LsmStorage.open(dir)) {
+            db.compact();
+            assertEquals(1, TableSet.open(dir).tables().size());
+            assertEquals(List.of(Map.entry("a", "first"), Map.entry("b", "second"),
+                    Map.entry("c", "third"), Map.entry("z", "newer table")), db.scan("", "zz"));
+            assertRetired(before);
+            try (var paths = Files.list(dir)) {
+                assertFalse(paths.anyMatch(path -> path.getFileName().toString().endsWith(".tmp")));
+            }
+        }
+    }
+
     private TableSet prepareInputs() throws IOException {
         try (Storage db = LsmStorage.open(dir)) {
             db.put("gone", "old");
