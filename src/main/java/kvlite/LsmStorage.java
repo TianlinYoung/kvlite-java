@@ -98,15 +98,26 @@ public final class LsmStorage implements Storage {
         }
         TableSet next = files.afterFlush();
         Path newest = next.tables().getFirst();
+
+        // 1. Publish the table while the old WAL can still recover the memtable.
         SSTableWriter.write(newest, table.sortedEntries());
+
+        // 2. Publish the empty WAL so the next manifest can reference an existing log.
         next.publishEmptyWal();
-        next.commit(); // Restart uses the old WAL until this atomic publication.
+
+        // 3. Atomically publish the manifest. Recovery now selects the new table and WAL.
+        next.commit();
+
+        // 4. Switch the live state to the committed generation before accepting more writes.
         wal.close();
         wal = new Wal(next.wal());
         table = new Memtable();
+        // Replay validates the header and positions the first append just after it.
         wal.replay(table);
         readers.addFirst(new FileSSTableReader(newest));
         files = next;
+
+        // 5. Retire old files after the commit and after closing the old WAL handle.
         files.cleanOrphans();
     }
 

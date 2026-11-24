@@ -35,11 +35,22 @@ final class FileSSTableReader implements SSTableReader {
         long indexStart = footer.getLong();
         int samples = footer.getInt();
         long count = footer.getLong();
-        if (footer.getInt() != FOOTER_MAGIC || indexStart < HEADER_BYTES || indexStart > footerStart
-                || count < 0 || count > (indexStart - HEADER_BYTES) / EntryCodec.HEADER
-                || samples != Math.ceilDiv(count, STRIDE)
-                || count == 0 && indexStart != HEADER_BYTES) {
-            throw new IOException("Invalid SSTable footer");
+        if (footer.getInt() != FOOTER_MAGIC) {
+            throw new IOException("Invalid SSTable footer magic");
+        }
+        if (indexStart < HEADER_BYTES || indexStart > footerStart) {
+            throw new IOException("SSTable index start outside file bounds: " + indexStart);
+        }
+        long maxRecords = (indexStart - HEADER_BYTES) / EntryCodec.HEADER;
+        if (count < 0 || count > maxRecords) {
+            throw new IOException("SSTable record count " + count + " outside range [0, " + maxRecords + "]");
+        }
+        long expectedSamples = Math.ceilDiv(count, STRIDE);
+        if (samples != expectedSamples) {
+            throw new IOException("Expected " + expectedSamples + " SSTable index samples, found " + samples);
+        }
+        if (count == 0 && indexStart != HEADER_BYTES) {
+            throw new IOException("Empty SSTable must have an empty data section");
         }
         var cursor = new TableCursor(file, indexStart, footerStart);
         long previous = -1;
@@ -50,10 +61,17 @@ final class FileSSTableReader implements SSTableReader {
             }
             String key = StandardCharsets.UTF_8.newDecoder().decode(cursor.read(length)).toString();
             long offset = cursor.read(Long.BYTES).getLong();
-            if (offset <= previous || offset > indexStart - EntryCodec.HEADER
-                    || i == 0 && offset != HEADER_BYTES
-                    || i > 0 && key.compareTo(index.lastKey()) <= 0) {
-                throw new IOException("Invalid sparse index order or offset");
+            if (i == 0 && offset != HEADER_BYTES) {
+                throw new IOException("First SSTable index offset must be " + HEADER_BYTES + ", found " + offset);
+            }
+            if (offset <= previous) {
+                throw new IOException("SSTable index offsets must increase at sample " + i);
+            }
+            if (offset > indexStart - EntryCodec.HEADER) {
+                throw new IOException("SSTable index offset leaves no room for a record header: " + offset);
+            }
+            if (i > 0 && key.compareTo(index.lastKey()) <= 0) {
+                throw new IOException("SSTable index keys must increase at sample " + i);
             }
             var anchor = new TableCursor(file, offset, indexStart);
             var recordHeader = anchor.read(EntryCodec.HEADER);

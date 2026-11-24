@@ -1,6 +1,7 @@
 // Publish sorted immutable records followed by their sparse index and fixed footer.
 package kvlite;
 
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -21,12 +22,13 @@ final class SSTableWriter {
 
     static void write(Path target, Iterable<Entry> records) throws IOException {
         Path temp = target.resolveSibling(target.getFileName() + ".tmp");
-        try (var file = FileChannel.open(temp, CREATE_NEW, WRITE)) {
-            var out = new DataOutputStream(Channels.newOutputStream(file));
+        try (var file = FileChannel.open(temp, CREATE_NEW, WRITE);
+             var out = new DataOutputStream(new BufferedOutputStream(Channels.newOutputStream(file)))) {
             var indexBytes = new ByteArrayOutputStream();
             var index = new DataOutputStream(indexBytes);
             out.writeInt(MAGIC);
             out.writeInt(1);
+            long offset = HEADER_BYTES;
             long count = 0;
             int samples = 0;
             String previous = null;
@@ -38,19 +40,23 @@ final class SSTableWriter {
                     byte[] key = EntryCodec.keyBytes(entry.key());
                     index.writeInt(key.length);
                     index.write(key);
-                    index.writeLong(file.position());
+                    index.writeLong(offset);
                     samples++;
                 }
-                out.write(EntryCodec.encode(entry));
+                byte[] encoded = EntryCodec.encode(entry);
+                out.write(encoded);
+                offset += encoded.length;
                 previous = entry.key();
                 count++;
             }
-            long indexStart = file.position();
+            long indexStart = offset;
             indexBytes.writeTo(out);
             out.writeLong(indexStart);
             out.writeInt(samples);
             out.writeLong(count);
             out.writeInt(FOOTER_MAGIC);
+            // Flush first so force can sync the bytes still held in the Java buffer.
+            out.flush();
             file.force(true);
         }
         Files.move(temp, target, ATOMIC_MOVE);

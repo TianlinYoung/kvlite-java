@@ -5,9 +5,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
+import static java.nio.file.StandardOpenOption.APPEND;
 import static org.junit.jupiter.api.Assertions.*;
 
 class FlushTest {
@@ -146,9 +148,22 @@ class FlushTest {
         bytes[bytes.length - 1] ^= 1;
         Files.write(table, bytes);
         Path orphan = Files.createFile(dir.resolve("wal-0000000000000000099.log"));
-        Files.write(current.wal(), new byte[]{1}, java.nio.file.StandardOpenOption.APPEND);
+        Files.write(current.wal(), new byte[]{1}, APPEND);
         assertThrows(IOException.class, () -> LsmStorage.open(dir));
         assertTrue(Files.exists(orphan));
         assertEquals(9, Files.size(current.wal()));
+    }
+
+    @Test void missingCommittedTablePreventsWalRepair() throws IOException {
+        TableSet next = TableSet.open(dir).afterFlush();
+        Path missing = next.tables().getFirst();
+        next.publishEmptyWal();
+        Files.write(next.wal(), new byte[]{1}, APPEND); // An incomplete frame that replay would truncate.
+        byte[] before = Files.readAllBytes(next.wal());
+        next.commit();
+
+        var error = assertThrows(NoSuchFileException.class, () -> LsmStorage.open(dir));
+        assertEquals(missing, Path.of(error.getFile()));
+        assertArrayEquals(before, Files.readAllBytes(next.wal()));
     }
 }

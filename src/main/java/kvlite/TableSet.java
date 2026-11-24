@@ -71,6 +71,7 @@ record TableSet(Path manifest, Path wal, List<Path> tables) {
 
     TableSet afterFlush() throws IOException {
         Path dir = manifest.getParent();
+        // A 19-digit generation can exceed Long.MAX_VALUE.
         BigInteger max = BigInteger.ZERO;
         // An interrupted publication or failed cleanup can leave higher generations on disk.
         for (String name : names(dir)) {
