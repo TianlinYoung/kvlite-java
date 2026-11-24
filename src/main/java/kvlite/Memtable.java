@@ -24,6 +24,11 @@ final class Memtable {
         return entries.values();
     }
 
+    EntrySource range(String fromInclusive, String toExclusive) {
+        var records = entries.subMap(fromInclusive, true, toExclusive, false).values().iterator();
+        return () -> records.hasNext() ? records.next() : null;
+    }
+
     boolean isEmpty() {
         return entries.isEmpty();
     }

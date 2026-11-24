@@ -111,6 +111,38 @@ final class FileSSTableReader implements SSTableReader {
         return null;
     }
 
+    @Override
+    public EntrySource entries() {
+        var cursor = new TableCursor(file, HEADER_BYTES, dataEnd);
+        return () -> cursor.remaining() > 0 ? cursor.readEntry() : null;
+    }
+
+    @Override
+    public EntrySource range(String fromInclusive, String toExclusive) {
+        var sample = index.floorEntry(fromInclusive);
+        // Below the first sample, begin at the first record. The upper sample bounds disk reads.
+        long start = sample == null ? HEADER_BYTES : sample.getValue();
+        var upperSample = index.ceilingEntry(toExclusive);
+        long end = upperSample == null ? dataEnd : upperSample.getValue();
+        var cursor = new TableCursor(file, start, end);
+        return new EntrySource() {
+            private boolean exhausted;
+
+            @Override
+            public Entry next() throws IOException {
+                while (!exhausted && cursor.remaining() > 0) {
+                    Entry entry = cursor.readEntry();
+                    if (entry.key().compareTo(toExclusive) >= 0) {
+                        exhausted = true;
+                    } else if (entry.key().compareTo(fromInclusive) >= 0) {
+                        return entry;
+                    }
+                }
+                return null;
+            }
+        };
+    }
+
     public void close() throws IOException {
         file.close();
     }
