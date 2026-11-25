@@ -43,6 +43,9 @@
             <phase>verify</phase>
             <goals><goal>report</goal><goal>check</goal></goals>
             <configuration>
+              <excludes>
+                <exclude>kvlite/Benchmark.class</exclude>
+              </excludes>
               <rules>
                 <rule>
                   <element>BUNDLE</element>

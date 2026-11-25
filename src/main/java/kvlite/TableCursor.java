@@ -25,7 +25,7 @@ final class TableCursor {
             throw new IOException("SSTable field exceeds its section at " + position);
         }
         ByteBuffer bytes = ByteBuffer.allocate(length);
-        // Positional reads leave the shared channel position alone so phase 4 readers can run concurrently.
+        // Positional reads leave the shared channel position alone so readers can run concurrently.
         while (bytes.hasRemaining()) {
             int n = file.read(bytes, position);
             if (n < 0) {

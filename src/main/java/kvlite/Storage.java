@@ -1,4 +1,4 @@
-// Public operations on a single-threaded string store.
+// Public operations on a string store shared by threads of one process.
 package kvlite;
 
 import java.io.Closeable;
@@ -11,6 +11,7 @@ public interface Storage extends Closeable {
     void put(String key, String value) throws IOException;
     Optional<String> get(String key) throws IOException;
     List<Map.Entry<String, String>> scan(String fromInclusive, String toExclusive) throws IOException;
+    Stats stats() throws IOException;
     void flush() throws IOException;
     void compact() throws IOException;
     void delete(String key) throws IOException;
