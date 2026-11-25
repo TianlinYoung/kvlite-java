@@ -37,6 +37,8 @@ flowchart TD
 
 点读只扫每个候选表的一个稀疏索引区间。范围为 `[fromInclusive, toExclusive)`，同 key 只保留最新版本。多个读者可以共享只读文件句柄，各游标用独立偏移定位读取。读 I/O 错误会报告给调用方。
 
+`FileChannel` 的可中断 I/O 遇到线程中断会关闭通道。读线程中断可能关闭共享的 SSTable 通道，导致此后访问该表的读取持续失败，而实例仍未标记为关闭。线程已处于中断状态时，`stats()` 查询文件大小可能关闭活动 WAL 通道。发生此类错误后，调用方应关闭实例，并用同一目录重新打开。请避免用线程中断取消存储操作。参见 [Java 21 InterruptibleChannel 文档](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/channels/InterruptibleChannel.html)。
+
 ## 提交与恢复
 
 | 退出时刻 | 重开时选择 | 回收条件 |

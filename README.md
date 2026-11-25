@@ -60,13 +60,15 @@ Input error: Scan lower bound exceeds upper bound
 
 `./mvnw verify` 跑 JUnit 5、构建 JAR，并执行 JaCoCo 的 85% 行覆盖率门槛。[Verify 工作流](.github/workflows/verify.yml) 在 push 和 PR 上用 JDK 21 检查 Ubuntu 和 Windows。测试包括 WAL 恢复、manifest 提交前后重开、5,000 步固定种子 TreeMap 对照、REPL 和 latch 控制的并发测试。覆盖率报告位于 `target/site/jacoco/index.html`。
 
+Compaction 并发测试在 compaction 取得写锁后暂停，验证此时 `get` 和 `put` 会阻塞。测试没有单独验证 `scan` 和 `flush` 的锁覆盖，也无法发现 manifest 提交后、切换 SSTable reader 前的短暂放锁。
+
 ## Benchmark
 
 ```sh
 java -cp target/kvlite-java-0.1-SNAPSHOT.jar kvlite.Benchmark
 ```
 
-2026-11-24 在同一台 Windows 11 主机上串行启动三个 JVM。Windows 报告 Intel Core i9-13900H、6 核 / 12 逻辑处理器、31.64 GiB 内存。临时目录位于 C:，使用 NTFS 和 Samsung MZVL21T0HCLR-00B00 NVMe SSD。系统版本为 10.0.26200 x64，运行时是 Eclipse Adoptium 25.0.2，JAR 编译目标为 Java 21。
+2026-11-24 在同一台 Windows 11 主机上串行启动三个 JVM。当时在 benchmark 主机上运行 `Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors`，Windows 报告 Intel Core i9-13900H、6 核 / 12 逻辑处理器。主机内存为 31.64 GiB。临时目录位于 C:，使用 NTFS 和 Samsung MZVL21T0HCLR-00B00 NVMe SSD。系统版本为 10.0.26200 x64，运行时是 Eclipse Adoptium 25.0.2，JAR 编译目标为 Java 21。
 
 | JVM | 写入 ops/s（秒） | 随机点读 ops/s（秒） | 命中率 |
 | --- | ---: | ---: | ---: |
